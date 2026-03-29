@@ -31,46 +31,6 @@ class MAPELoss(nn.Module):
     def forward(self, pred, target):
         return torch.mean(torch.abs((target - pred) / (torch.abs(target) + self.eps))) * 100
 
-# 2. HÀM LOSS CHO SCENARIO 2 (TOTAL COST)
-class MinTotalCostLoss(nn.Module):
-    def __init__(self, h=2, L=2, o=50000, cs_steps=100):
-        super(MinTotalCostLoss, self).__init__()
-        self.h = h
-        self.L = L
-        self.o = o
-        self.cs = torch.linspace(0.1, 10.0, cs_steps).view(-1, 1)
-        self.normal = Normal(0.0, 1.0)
-
-    def forward(self, preds, trues):
-        rmse = torch.sqrt(torch.mean((trues - preds)**2, dim=1)) + 1e-5
-        rmse = rmse.view(1, -1) 
-        mu_D = torch.mean(preds, dim=1)
-        mu_D = torch.clamp(mu_D, min=1e-4).view(1, -1)
-        cs_device = self.cs.to(preds.device) # Kích thước: [100, 1]
-        q_star = torch.sqrt((2 * mu_D * self.o) / self.h)
-        
-        alpha = 1.0 - (self.h * q_star) / (cs_device * mu_D)
-        alpha = torch.clamp(alpha, min=0.5001, max=0.9999) 
-        
-        z_alpha = self.normal.icdf(alpha)
-        ss = torch.relu(z_alpha * rmse * math.sqrt(self.L))
-        
-        phi_z = torch.exp(-0.5 * z_alpha**2) / math.sqrt(2 * math.pi)
-        Phi_z = self.normal.cdf(z_alpha)
-        lz = phi_z - z_alpha * (1.0 - Phi_z)
-        
-        e_s = lz * rmse * math.sqrt(self.L)
-        
-        E_cs = (cs_device * e_s * mu_D) / q_star
-        c_o = (mu_D / q_star) * self.o
-        c_h = (q_star / 2.0 + ss) * self.h
-        
-        tc = c_o + c_h + E_cs
-        
-        best_tc, _ = torch.min(tc, dim=0)
-        
-        return torch.mean(best_tc)
-
 # 4. HÀM TRAIN HOÀN CHỈNH
 def train_model(model, train_loader, val_loader, test_loader, epochs, lr, device='gpu', scenario=1,h=2, L=2, o=50000,cs_steps=100):
     criterion = nn.L1Loss() # Hoặc MAPELoss() tùy bạn chọn
@@ -106,7 +66,8 @@ def train_model(model, train_loader, val_loader, test_loader, epochs, lr, device
         val_trues_tensor = torch.cat(val_trues, dim=0)
         val_preds_tensor = torch.clamp(val_preds_tensor, min=0.0)
         
-        val_tc = tc_calculate(val_preds_tensor, val_trues_tensor).item() 
+        val_tc_tensor, val_cs = tc_calculate(val_preds_tensor, val_trues_tensor)
+        val_tc = val_tc_tensor.item()
         val_preds_flat = val_preds_tensor.flatten()
         val_trues_flat = val_trues_tensor.flatten()
         
@@ -130,7 +91,7 @@ def train_model(model, train_loader, val_loader, test_loader, epochs, lr, device
         scheduler.step(current_score)
         
         if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1:03d} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}% | Val TC: {val_tc:,.0f}")
+            print(f"Epoch {epoch+1:03d} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}% | Val TC: {val_tc:,.0f}| Opt cs: {val_cs:.2f}")
         
         if no_improve >= patience_limit:
             print(f"Early Stopping tại epoch {epoch+1}")
@@ -148,13 +109,15 @@ def train_model(model, train_loader, val_loader, test_loader, epochs, lr, device
     test_preds_tensor = torch.clamp(torch.cat(test_preds, dim=0), min=0.0)
     test_trues_tensor = torch.cat(test_trues, dim=0)
     
-    test_tc = tc_calculate(test_preds_tensor, test_trues_tensor).item()
+    test_tc_tensor, test_cs = tc_calculate(test_preds_tensor, test_trues_tensor)
+    test_tc = test_tc_tensor.item()
     
     test_preds_flat = test_preds_tensor.flatten()
     test_trues_flat = test_trues_tensor.flatten()
     test_mape = torch.mean(torch.abs((test_trues_flat - test_preds_flat) / (test_trues_flat + 1e-5))).item() * 100
     
     print("-" * 30)
-    print(f"KẾT QUẢ TRÊN TẬP TEST (Unbiased Evaluation):")
-    print(f"Test MAPE: {test_mape:.2f}% | Test TC: {test_tc:,.0f}\n")
+    print(f"Test MAPE: {test_mape:.2f}% | Test TC: {test_tc:,.0f}")
+    print(f"🎯 Optimal Shortage Cost (cs) found: {test_cs:.2f}")
+    print("-" * 30 + "\n")
     return model

@@ -9,7 +9,7 @@ class Inventory_model(nn.Module):
         self.h = h
         self.L = L
         self.o = o
-        self.cs = torch.linspace(0.1, 10.0, cs_steps).view(-1, 1)
+        self.cs = torch.linspace(0.01, 10.0, cs_steps).view(-1, 1) # Giữ chuẩn 0.1 đến 10
         self.normal = Normal(0.0, 1.0)
 
     def forward(self, preds, trues):
@@ -17,11 +17,18 @@ class Inventory_model(nn.Module):
         rmse = rmse.view(1, -1) 
         mu_D = torch.mean(preds, dim=1)
         mu_D = torch.clamp(mu_D, min=1e-4).view(1, -1)
-        cs_device = self.cs.to(preds.device) # Kích thước: [100, 1]
+        cs_device = self.cs.to(preds.device)
+        
         q_star = torch.sqrt((2 * mu_D * self.o) / self.h)
         
-        alpha = 1.0 - (self.h * q_star) / (cs_device * mu_D)
-        alpha = torch.clamp(alpha, min=0.5001, max=0.9999) 
+        # 1. Tính alpha gốc chưa qua chỉnh sửa
+        alpha_raw = 1.0 - (self.h * q_star) / (cs_device * mu_D)
+        
+        # 2. TẠO BỨC TƯỜNG CHẶN: Đánh dấu các kịch bản hợp lệ (alpha > 0.001)
+        valid_mask = alpha_raw > 0.001
+        
+        # Vẫn dùng clamp để Pytorch không báo lỗi NaN khi tính z_score phía dưới
+        alpha = torch.clamp(alpha_raw, min=1e-4, max=0.9999) 
         
         z_alpha = self.normal.icdf(alpha)
         ss = torch.relu(z_alpha * rmse * math.sqrt(self.L))
@@ -38,6 +45,11 @@ class Inventory_model(nn.Module):
         
         tc = c_o + c_h + E_cs
         
-        best_tc, _ = torch.min(tc, dim=0)
+        # 3. XÂY VÁCH ĐÁ: Nếu alpha không hợp lệ, ép TC bằng VÔ CỰC (Infinity)
+        tc = torch.where(valid_mask, tc, torch.tensor(float('inf'), device=tc.device))
         
-        return torch.mean(best_tc)
+        # 4. Tối ưu: Lúc này torch.min chắc chắn sẽ chọn đúng đáy chữ U (quanh 1.54)
+        best_tc, best_idx = torch.min(tc, dim=0)
+        best_cs_vals = cs_device[best_idx].squeeze()
+        
+        return torch.mean(best_tc), torch.mean(best_cs_vals).item()
