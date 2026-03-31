@@ -62,13 +62,13 @@ def train_model(model, train_loader, val_loader, test_loader, epochs, lr, device
         if scenario == 1:
             current_score = val_mape
             if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}%")
+                print(f"Epoch {epoch+1:03d} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}%")
         else:
             val_tc_tensor, val_cs = tc_calculate(val_preds_tensor, val_trues_tensor)
             val_tc = val_tc_tensor.item()
             current_score = val_tc
             if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}% | Val TC: {val_tc:,.0f}| Opt cs: {val_cs:.2f}")
+                print(f"Epoch {epoch+1:03d} | MSE: {val_mse:.4f} | MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.2f}% | Val TC: {val_tc:,.0f}| Opt cs: {val_cs:.2f}")
         
         if current_score < best_val_score:
             best_val_score = current_score
