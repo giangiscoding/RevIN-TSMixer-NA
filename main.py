@@ -3,26 +3,198 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
-import itertools
+import optuna
+from optuna.samplers import TPESampler
 from train.trainer import train_model, set_seed, create_sequences
 from models.revin_tsmixer import RevIN_TSMixer
 
+# Tắt log verbose của Optuna, chỉ giữ WARNING trở lên
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+
 def get_dataloaders(seq_len, batch_size, real_data, pred_len, target_idx=0):
     X, y = create_sequences(real_data, seq_len, pred_len, target_idx=target_idx)
+
+    # Split 75:10:15
     train_end = int(len(X) * 0.8)
     val_end   = int(len(X) * 0.9)
 
-    X_train = torch.tensor(X[:train_end], dtype=torch.float32)
-    y_train = torch.tensor(y[:train_end], dtype=torch.float32)
-    X_val = torch.tensor(X[train_end:val_end], dtype=torch.float32)
-    y_val = torch.tensor(y[train_end:val_end], dtype=torch.float32)
-    X_test = torch.tensor(X[val_end:], dtype=torch.float32)
-    y_test = torch.tensor(y[val_end:], dtype=torch.float32)
+    X_train = torch.tensor(X[:train_end],        dtype=torch.float32)
+    y_train = torch.tensor(y[:train_end],        dtype=torch.float32)
+    X_val   = torch.tensor(X[train_end:val_end], dtype=torch.float32)
+    y_val   = torch.tensor(y[train_end:val_end], dtype=torch.float32)
+    X_test  = torch.tensor(X[val_end:],          dtype=torch.float32)
+    y_test  = torch.tensor(y[val_end:],          dtype=torch.float32)
 
-    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(TensorDataset(X_val, y_val), batch_size=batch_size, shuffle=False)
-    test_loader  = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader   = DataLoader(TensorDataset(X_val,   y_val),   batch_size=batch_size, shuffle=False, drop_last=True)
+    test_loader  = DataLoader(TensorDataset(X_test,  y_test),  batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, test_loader
+
+
+def make_objective(scenario, raw_data, pred_len, num_features, target_idx, device, seed):
+    """
+    Trả về hàm objective cho Optuna.
+
+    scenario = 's1' : minimize val_mape  (Scenario 1 – min MAPE)
+    scenario = 's2' : minimize val_tc    (Scenario 2 – min Total Cost)
+    """
+    def objective(trial):
+        # ================================================================
+        # Không gian tìm kiếm – rộng hơn grid search, TPE tự thu hẹp
+        # ================================================================
+        params = {
+            # categorical: TPE chọn từ danh sách rời rạc
+            'seq_len'      : trial.suggest_categorical('seq_len',    [1, 2, 3 ,4 ,5, 6, 7, 8, 9,10,11, 12]),
+            'n_block'      : trial.suggest_categorical('n_block',    [1, 2, 3]),
+            'ff_dim'       : trial.suggest_categorical('ff_dim',     [8, 16,32, 64, 128]),
+            'batch_size'   : trial.suggest_categorical('batch_size', [1,2,3, 4]),
+            'learning_rate': trial.suggest_categorical('learning_rate', [1e-4, 1e-5]),
+            'dropout'      : trial.suggest_categorical('dropout', [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]),
+        }
+
+        # Reset seed mỗi trial để reproducibility
+        set_seed(seed)
+
+        try:
+            train_loader, val_loader, test_loader = get_dataloaders(
+                seq_len=params['seq_len'],
+                batch_size=params['batch_size'],
+                real_data=raw_data,
+                pred_len=pred_len,
+                target_idx=target_idx,
+            )
+
+            model = RevIN_TSMixer(
+                seq_len=params['seq_len'],
+                pred_len=pred_len,
+                num_features=num_features,
+                ff_dim=params['ff_dim'],
+                num_layers=params['n_block'],
+                dropout=params['dropout'],
+            )
+
+            val_mape, test_mape, val_tc, test_tc = train_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                epochs=50,
+                lr=params['learning_rate'],
+                device=device,
+                target_idx=target_idx,
+                num_features=num_features,
+            )
+
+            # Lưu tất cả metrics vào trial để truy xuất sau
+            trial.set_user_attr('test_mape', test_mape)
+            trial.set_user_attr('test_tc',   test_tc)
+            trial.set_user_attr('val_mape',  val_mape)
+            trial.set_user_attr('val_tc',    val_tc)
+            trial.set_user_attr('params',    params)
+
+            return val_mape if scenario == 's1' else val_tc
+
+        except Exception as e:
+            print(f"  [Trial {trial.number}] Lỗi: {e}")
+            return float('inf')
+
+    return objective
+
+
+def run_study(scenario, raw_data, pred_len, num_features,
+              target_idx, device, seed, n_trials=50):
+    """
+    Chạy Optuna study cho một scenario.
+    Trả về best_params, best_val, best_test_mape, best_test_tc, study.
+    """
+    scenario_label = "1 – Min MAPE" if scenario == 's1' else "2 – Min Total Cost"
+    metric_name    = "MAPE" if scenario == 's1' else "Total Cost"
+
+    print(f"\n{'='*60}")
+    print(f"Optuna TPE – Scenario {scenario_label}")
+    print(f"Số trials: {n_trials}  |  Startup (random): 10")
+    print(f"{'='*60}")
+
+    # ================================================================
+    # TPESampler:
+    # - n_startup_trials=10: 10 trial đầu chạy random để khởi động
+    # - multivariate=True  : học tương quan giữa các hyperparameter,
+    #   ví dụ ff_dim lớn thường cần lr nhỏ hơn để ổn định
+    # - seed               : đảm bảo reproducibility
+    # ================================================================
+    sampler = TPESampler(
+        seed=seed,
+        n_startup_trials=10,
+        multivariate=True,
+    )
+
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=sampler,
+        study_name=f'revin_tsmixer_{scenario}',
+    )
+
+    objective = make_objective(
+        scenario=scenario,
+        raw_data=raw_data,
+        pred_len=pred_len,
+        num_features=num_features,
+        target_idx=target_idx,
+        device=device,
+        seed=seed,
+    )
+
+    # Callback in progress mỗi trial
+    def print_callback(study, trial):
+        if trial.value is None or trial.value == float('inf'):
+            return
+        p = trial.user_attrs.get('params', {})
+        print(f"  Trial {trial.number:3d} | "
+              f"Val {metric_name}: {trial.value:>12,.2f} | "
+              f"Best: {study.best_value:>12,.2f} | "
+              f"seq={p.get('seq_len','?')} "
+              f"block={p.get('n_block','?')} "
+              f"ff={p.get('ff_dim','?')} "
+              f"lr={p.get('learning_rate', 0):.0e} "
+              f"drop={p.get('dropout','?')}")
+
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        callbacks=[print_callback],
+        show_progress_bar=False,
+    )
+
+    best_trial     = study.best_trial
+    best_params    = best_trial.user_attrs.get('params', {})
+    best_val       = best_trial.value
+    best_test_mape = best_trial.user_attrs.get('test_mape', float('nan'))
+    best_test_tc   = best_trial.user_attrs.get('test_tc',   float('nan'))
+
+    return best_params, best_val, best_test_mape, best_test_tc, study
+
+
+def print_top5(study, scenario):
+    metric_name = "Val MAPE" if scenario == 's1' else "Val TC"
+    test_key    = 'test_mape' if scenario == 's1' else 'test_tc'
+    test_label  = "Test MAPE" if scenario == 's1' else "Test TC"
+
+    trials = sorted(
+        [t for t in study.trials if t.value not in (None, float('inf'))],
+        key=lambda t: t.value
+    )[:5]
+
+    print(f"\nTop 5 trials – Scenario {'1' if scenario=='s1' else '2'}:")
+    for t in trials:
+        p    = t.user_attrs.get('params', {})
+        tval = t.user_attrs.get(test_key, float('nan'))
+        fmt  = f"{tval:.2f}%" if scenario == 's1' else f"{tval:,.0f}"
+        print(f"  Trial {t.number:3d} | {metric_name}: {t.value:>10,.2f} | "
+              f"{test_label}: {fmt} | "
+              f"seq={p.get('seq_len')} block={p.get('n_block')} "
+              f"ff={p.get('ff_dim')} lr={p.get('learning_rate',0):.0e} "
+              f"drop={p.get('dropout')}")
 
 
 def main():
@@ -35,97 +207,60 @@ def main():
     csv_path = 'data/data_TSI_v2.csv'
     df = pd.read_csv(csv_path)
 
-    selected_columns = ['Imports', 'IPI', 'DisbursedFDI', 'CompetitorQuantity', 'PromotionAmount', 'Quantity']
+    selected_columns = ['Imports', 'IPI', 'DisbursedFDI',
+                        'CompetitorQuantity', 'PromotionAmount', 'Quantity']
     df = df[selected_columns]
 
-    target_idx = df.columns.get_loc('Quantity')
-
-    raw_data = df.values.astype(np.float32)
-    pred_len = 3 
+    target_idx   = df.columns.get_loc('Quantity')
+    raw_data     = df.values.astype(np.float32)
+    pred_len     = 3
     num_features = raw_data.shape[1]
 
-    param_grid = {
-        'seq_len': [6, 9],
-        'n_block': [1, 2],
-        'dropout': [0.1, 0.3],
-        'batch_size': [2, 4],
-        'ff_dim': [64, 128],
-        'learning_rate': [1e-4, 1e-5],
-    }
-
-    keys, values  = zip(*param_grid.items())
-    combinations  = [dict(zip(keys, v)) for v in itertools.product(*values)]
-
-    best_s1_params, best_global_val_mape, best_global_test_mape = None, float('inf'), float('inf')
-    best_s2_params, best_global_val_tc, best_global_test_tc = None, float('inf'), float('inf')
-
-    for i, params in enumerate(combinations):
-        print(f"\n[{i+1}/{len(combinations)}] Đang thử nghiệm: {params}")
-
-        set_seed(GLOBAL_SEED)
-
-        train_loader, val_loader, test_loader = get_dataloaders(
-            seq_len=params['seq_len'],
-            batch_size=params['batch_size'],
-            real_data=raw_data,
-            pred_len=pred_len,
-            target_idx=target_idx,
-        )
-
-        model = RevIN_TSMixer(
-            seq_len=params['seq_len'],
-            pred_len=pred_len,
-            num_features=num_features,
-            ff_dim=params['ff_dim'],
-            num_layers=params['n_block'],
-            dropout=params['dropout'],
-        )
-
-        try:
-            val_mape, test_mape, val_tc, test_tc = train_model(
-                model=model,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                test_loader=test_loader,
-                epochs=100,
-                lr=params['learning_rate'],
-                device=device,
-                target_idx=target_idx,
-                num_features=num_features,
-            )
-
-            print(f"  -> [S1 - MAPE] Val: {val_mape:.2f}% | Test: {test_mape:.2f}%")
-            print(f"  -> [S2 - Cost] Val: {val_tc:,.0f} | Test: {test_tc:,.0f}")
-
-            # Chọn config tốt nhất theo val metric (không dùng test để tránh data leakage)
-            if val_mape < best_global_val_mape:
-                best_global_val_mape = val_mape
-                best_global_test_mape = test_mape
-                best_s1_params = params
-
-            if val_tc < best_global_val_tc:
-                best_global_val_tc = val_tc
-                best_global_test_tc = test_tc
-                best_s2_params = params
-
-        except Exception as e:
-            print(f"  -> [LỖI] Cấu hình thất bại: {e}")
-            continue
+    # ================================================================
+    # Scenario 1 – Tối ưu MAPE
+    # ================================================================
+    s1_params, s1_val_mape, s1_test_mape, s1_test_tc, study_s1 = run_study(
+        scenario='s1',
+        raw_data=raw_data,
+        pred_len=pred_len,
+        num_features=num_features,
+        target_idx=target_idx,
+        device=device,
+        seed=GLOBAL_SEED,
+        n_trials=50,
+    )
 
     # ================================================================
-    # In kết quả cuối
+    # Scenario 2 – Tối ưu Total Cost
     # ================================================================
-    print("\n" + "=" * 55)
+    s2_params, s2_val_tc, s2_test_mape, s2_test_tc, study_s2 = run_study(
+        scenario='s2',
+        raw_data=raw_data,
+        pred_len=pred_len,
+        num_features=num_features,
+        target_idx=target_idx,
+        device=device,
+        seed=GLOBAL_SEED,
+        n_trials=50,
+    )
+
+    # ================================================================
+    # Kết quả cuối
+    # ================================================================
+    print("\n" + "=" * 60)
     print("KỊCH BẢN 1: TỐI ƯU HÓA SAI SỐ (MIN MAPE)")
-    print(f"Cấu hình tối ưu : {best_s1_params}")
-    print(f"Val MAPE : {best_global_val_mape:.2f}%")
-    print(f"Test MAPE : {best_global_test_mape:.2f}%")
-    print("-" * 55)
+    print(f"  Cấu hình tối ưu : {s1_params}")
+    print(f"  Val  MAPE       : {s1_val_mape:.2f}%")
+    print(f"  Test MAPE       : {s1_test_mape:.2f}%")
+    print("-" * 60)
     print("KỊCH BẢN 2: TỐI ƯU HÓA CHI PHÍ (MIN TOTAL COST)")
-    print(f"Cấu hình tối ưu : {best_s2_params}")
-    print(f"Val Cost : {best_global_val_tc:,.0f}")
-    print(f"Test Cost : {best_global_test_tc:,.0f}")
-    print("=" * 55)
+    print(f"  Cấu hình tối ưu : {s2_params}")
+    print(f"  Val  Cost       : {s2_val_tc:,.0f}")
+    print(f"  Test Cost       : {s2_test_tc:,.0f}")
+    print("=" * 60)
+
+    print_top5(study_s1, 's1')
+    print_top5(study_s2, 's2')
 
 
 if __name__ == "__main__":
