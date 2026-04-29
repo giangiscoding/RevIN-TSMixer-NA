@@ -8,8 +8,7 @@ class RevIN_TSMixer(nn.Module):
     def __init__(self, seq_len: int, pred_len: int, num_features: int, ff_dim: int, num_layers: int, dropout: float = 0.1):
         super(RevIN_TSMixer, self).__init__()
         self.revin = RevIN(num_features)
-        
-        # Khởi tạo K lớp Mixing (Algorithm 1)
+    
         self.mixer_layers = nn.ModuleList([
             TSMixerLayer(seq_len, num_features, ff_dim, dropout=dropout)
             for _ in range(num_layers)

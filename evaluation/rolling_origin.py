@@ -80,20 +80,29 @@ def train_one_fold(model, train_loader, val_loader, epochs, lr, device,
         best_wts_s2 : state_dict tối ưu theo val Total Cost
         history     : dict chứa val_mape và val_tc qua các epoch
     """
+    # ================================================================
+    # Ba tầng tách biệt:
+    #   1. Train loss  : MSELoss  → gradient mỗi batch
+    #   2. Early stop  : val MSE  → dừng khi không cải thiện
+    #   3. Best weights: lưu theo val MAPE (S1) và val TC (S2)
+    # ================================================================
     criterion  = nn.MSELoss()
     optimizer  = torch.optim.Adam(model.parameters(), lr=lr)
     tc_calc    = Inventory_model(h=h, L=L, o=o, cs_steps=cs_steps).to(device)
     model.to(device)
 
+    # Early stopping theo val MSE
+    best_val_mse = float('inf')
+    no_improve   = 0
+
+    # Best weights theo từng metric
     best_val_mape = float('inf')
     best_wts_s1   = copy.deepcopy(model.state_dict())
-    no_improve_s1 = 0
 
     best_val_tc   = float('inf')
     best_wts_s2   = copy.deepcopy(model.state_dict())
-    no_improve_s2 = 0
 
-    history = {'val_mape': [], 'val_tc': []}
+    history = {'val_mape': [], 'val_tc': [], 'val_mse': []}
 
     for epoch in range(epochs):
         # ---- Train ----
@@ -118,6 +127,19 @@ def train_one_fold(model, train_loader, val_loader, epochs, lr, device,
         vp = torch.clamp(torch.cat(val_preds), min=0.0)
         vt = torch.cat(val_trues)
 
+        # Tầng 2: Early stopping theo val MSE
+        val_mse = torch.mean((vt - vp) ** 2).item()
+        history['val_mse'].append(val_mse)
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            no_improve   = 0
+        else:
+            no_improve  += 1
+
+        if no_improve >= patience:
+            break
+
+        # Tầng 3: Cập nhật best weights theo MAPE và TC
         val_mape = (torch.mean(torch.abs(
             (vt.flatten() - vp.flatten())
             / torch.clamp(vt.flatten(), min=1e-5)
@@ -129,27 +151,15 @@ def train_one_fold(model, train_loader, val_loader, epochs, lr, device,
         history['val_mape'].append(val_mape)
         history['val_tc'].append(val_tc)
 
-        # Early stopping S1
         if val_mape < best_val_mape:
             best_val_mape = val_mape
             best_wts_s1   = copy.deepcopy(model.state_dict())
-            no_improve_s1 = 0
-        else:
-            no_improve_s1 += 1
 
-        # Early stopping S2
         if val_tc < best_val_tc:
-            best_val_tc   = val_tc
-            best_wts_s2   = copy.deepcopy(model.state_dict())
-            no_improve_s2 = 0
-        else:
-            no_improve_s2 += 1
+            best_val_tc = val_tc
+            best_wts_s2 = copy.deepcopy(model.state_dict())
 
-        if no_improve_s1 >= patience and no_improve_s2 >= patience:
-            break
-
-    return best_wts_s1, best_wts_s2, history
-
+    return best_wts_s1, best_wts_s2, history, best_val_mape, best_val_tc
 
 # ===========================================================================
 # Rolling-origin evaluation
@@ -252,7 +262,7 @@ def rolling_origin_evaluate(
         set_seed(seed)
         model = model_fn()
 
-        best_wts_s1, best_wts_s2, _ = train_one_fold(
+        best_wts_s1, best_wts_s2, _, _, _ = train_one_fold(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,

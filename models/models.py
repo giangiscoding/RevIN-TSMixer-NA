@@ -6,21 +6,27 @@ Mỗi model tuân thủ interface chung:
 
 Models:
     TSMixer        - TSMixer gốc không có RevIN (bài báo Section 3.2.2)
+    RevIN_TSMixer  - TSMixer có RevIN
     DLinear        - Decomposition Linear (Zeng et al., 2023)
+    RevIN_DLinear  - DLinear có RevIN
     NLinear        - Normalized Linear (Zeng et al., 2023)
-    NBEATSBaseline - N-BEATS (Oreshkin et al., 2020), generic stack
-    NHiTSBaseline  - N-HiTS (Challu et al., 2023)
+    RevIN_NLinear  - NLinear có RevIN
+    NBEATS - N-BEATS (Oreshkin et al., 2020), generic stack
+    RevIN_NBEATS   - N-BEATS có RevIN
+    NHiTS  - N-HiTS (Challu et al., 2023)
+    RevIN_NHiTS    - N-HiTS có RevIN
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .revin import RevIN
 from models.mixer_layers import TSMixerLayer
 from models.temporalprojectionlayer import TemporalProjectionLayer
 
 
 # ======================================================================
-# 1. TSMixer – không có RevIN
+# TSMixer
 # ======================================================================
 class TSMixer(nn.Module):
     """TSMixer gốc (Algorithm 1 trong bài báo), không có RevIN wrapper."""
@@ -39,6 +45,33 @@ class TSMixer(nn.Module):
             x = layer(x)
         return self.projection(x)
 
+# ======================================================================
+# RevIN - TSMixer
+# ======================================================================
+class RevIN_TSMixer(nn.Module):
+    def __init__(self, seq_len: int, pred_len: int, num_features: int, ff_dim: int, num_layers: int, dropout: float = 0.1):
+        super(RevIN_TSMixer, self).__init__()
+        self.revin = RevIN(num_features)
+        
+        # Khởi tạo K lớp Mixing (Algorithm 1)
+        self.mixer_layers = nn.ModuleList([
+            TSMixerLayer(seq_len, num_features, ff_dim, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        
+        self.projection = TemporalProjectionLayer(seq_len, pred_len)
+
+    def forward(self, x: torch.Tensor):
+        # Đầu vào: [B, T, C]
+        x = self.revin(x, mode='norm')       # Chuẩn hóa RevIN
+        
+        for layer in self.mixer_layers:
+            x = layer(x)                     # Qua các lớp Mixer
+            
+        x = self.projection(x)               # Chiếu thời gian: [B, T, C] -> [B, N, C]
+        x = self.revin(x, mode='denorm')     # Giải chuẩn hóa RevIN
+        
+        return x
 
 # ======================================================================
 # 2. DLinear – Decomposition Linear
@@ -88,6 +121,19 @@ class DLinear(nn.Module):
         out = (trend_out + seasonal_out).permute(0, 2, 1)            # [B, pred_len, C]
         return out
 
+class RevIN_DLinear(nn.Module):
+    """DLinear bọc RevIN."""
+    def __init__(self, seq_len: int, pred_len: int, num_features: int,
+                 kernel_size: int = 25):
+        super().__init__()
+        self.revin = RevIN(num_features)
+        self.dlinear = DLinear(seq_len, pred_len, num_features, kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.revin(x, mode='norm')
+        out = self.dlinear(x)
+        out = self.revin(out, mode='denorm')
+        return out
 
 # ======================================================================
 # 3. NLinear – Normalized Linear
@@ -116,6 +162,18 @@ class NLinear(nn.Module):
         out = out + last
         return out
 
+class RevIN_NLinear(nn.Module):
+    """NLinear bọc RevIN."""
+    def __init__(self, seq_len: int, pred_len: int, num_features: int):
+        super().__init__()
+        self.revin = RevIN(num_features)
+        self.nlinear = NLinear(seq_len, pred_len, num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.revin(x, mode='norm')
+        out = self.nlinear(x)
+        out = self.revin(out, mode='denorm')
+        return out
 
 # ======================================================================
 # 4. N-BEATS – Neural Basis Expansion Analysis
@@ -143,9 +201,9 @@ class NBEATSBlock(nn.Module):
         return backcast, forecast
 
 
-class NBEATSBaseline(nn.Module):
+class NBEATS(nn.Module):
     """
-    N-BEATS generic stack – channel-independent (mỗi feature xử lý độc lập).
+    N-BEATS generic stack - channel-independent (mỗi feature xử lý độc lập).
     Stack nhiều block, residual connection trên backcast.
     """
     def __init__(self, seq_len: int, pred_len: int, num_features: int,
@@ -177,6 +235,20 @@ class NBEATSBaseline(nn.Module):
         out = forecast_sum.reshape(B, C, self.pred_len).permute(0, 2, 1)
         return out
 
+class RevIN_NBEATS(nn.Module):
+    """N-BEATS bọc RevIN."""
+    def __init__(self, seq_len: int, pred_len: int, num_features: int,
+                 units: int = 64, n_blocks: int = 3, n_layers: int = 4):
+        super().__init__()
+        self.revin = RevIN(num_features)
+        self.nbeats = NBEATS(seq_len, pred_len, num_features,
+                                     units, n_blocks, n_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.revin(x, mode='norm')
+        out = self.nbeats(x)
+        out = self.revin(out, mode='denorm')
+        return out
 
 # ======================================================================
 # 5. N-HiTS – Neural Hierarchical Interpolation for Time Series
@@ -241,7 +313,7 @@ class NHiTSBlock(nn.Module):
         return backcast_full, forecast
 
 
-class NHiTSBaseline(nn.Module):
+class NHiTS(nn.Module):
     """
     N-HiTS: stack nhiều block với pool_size tăng dần để học multi-scale pattern.
     Channel-independent giống N-BEATS.
@@ -277,4 +349,19 @@ class NHiTSBaseline(nn.Module):
 
         # [B*C, pred_len] → [B, pred_len, C]
         out = forecast_sum.reshape(B, C, self.pred_len).permute(0, 2, 1)
+        return out
+
+class RevIN_NHiTS(nn.Module):
+    """N-HiTS bọc RevIN."""
+    def __init__(self, seq_len: int, pred_len: int, num_features: int,
+                 units: int = 64, pool_sizes: list = None, n_layers: int = 2):
+        super().__init__()
+        self.revin = RevIN(num_features)
+        self.nhits = NHiTS(seq_len, pred_len, num_features,
+                                   units, pool_sizes, n_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.revin(x, mode='norm')
+        out = self.nhits(x)
+        out = self.revin(out, mode='denorm')
         return out
