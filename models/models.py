@@ -32,7 +32,7 @@ class TSMixer(nn.Module):
     """TSMixer gốc (Algorithm 1 trong bài báo), không có RevIN wrapper."""
 
     def __init__(self, seq_len: int, pred_len: int, num_features: int,
-                 ff_dim: int, num_layers: int, dropout: float = 0.1):
+                 ff_dim: int, num_layers: int, dropout: float):
         super().__init__()
         self.mixer_layers = nn.ModuleList([
             TSMixerLayer(seq_len, num_features, ff_dim, dropout=dropout)
@@ -49,7 +49,7 @@ class TSMixer(nn.Module):
 # RevIN - TSMixer
 # ======================================================================
 class RevIN_TSMixer(nn.Module):
-    def __init__(self, seq_len: int, pred_len: int, num_features: int, ff_dim: int, num_layers: int, dropout: float = 0.1):
+    def __init__(self, seq_len: int, pred_len: int, num_features: int, ff_dim: int, num_layers: int, dropout: float):
         super(RevIN_TSMixer, self).__init__()
         self.revin = RevIN(num_features)
         

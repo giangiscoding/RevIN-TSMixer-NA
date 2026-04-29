@@ -23,8 +23,8 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 def get_dataloaders(seq_len, batch_size, real_data, pred_len, target_idx=0):
     X, y = create_sequences(real_data, seq_len, pred_len, target_idx=target_idx)
 
-    train_end = int(len(X) * 0.8)
-    val_end   = int(len(X) * 0.9)
+    train_end = int(len(X) * 0.6)
+    val_end   = int(len(X) * 0.8)
 
     X_train = torch.tensor(X[:train_end],        dtype=torch.float32)
     y_train = torch.tensor(y[:train_end],        dtype=torch.float32)
