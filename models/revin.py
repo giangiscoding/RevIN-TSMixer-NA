@@ -39,6 +39,6 @@ class RevIN(nn.Module):
 
     def _denormalize(self, x: torch.Tensor):      
         if self.affine:
-            x = (x - self.beta) / self.gamma
+            x = (x - self.beta) / (self.gamma + 1e-6)
         x = x * self.stdev + self.mean
         return x
